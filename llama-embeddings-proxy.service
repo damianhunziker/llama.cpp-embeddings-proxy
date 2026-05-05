@@ -1,0 +1,16 @@
+[Unit]
+Description=Llama.cpp General Purpose Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=damian
+WorkingDirectory=/home/damian/services/llama.cpp-embeddings-proxy
+ExecStart=/home/damian/services/llama.cpp-embeddings-proxy/.venv/bin/python -u proxy.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

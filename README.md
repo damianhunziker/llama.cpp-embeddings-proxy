@@ -217,4 +217,30 @@ The proxy uses `podman exec` into container `llama-rocm7-nightlies` to manage ll
 ## Note
 
 All timing behavior, cleanup, and parallelization remain identical to the original embeddings-only proxy. Only the endpoint support and instance model have been extended.
+
+## Testing
+
+### Parallel Chat Completion Tests
+
+Test script: [`test_parallel_chat.py`](test_parallel_chat.py)
+
+```bash
+# Test parallel instances (3 by default)
+python test_parallel_chat.py parallel 5
+
+# Stress test with concurrent requests
+python test_parallel_chat.py stress 20
+
+# Continuous load test (60s, 3 parallel by default)
+python test_parallel_chat.py load 120 5
+
+# Run all tests
+python test_parallel_chat.py all
+```
+
+Tests verify:
+- Multiple instances running simultaneously on different ports
+- VRAM status before/after
+- Parallel execution timing
+- Success/failure rates
 # llama.cpp-embeddings-proxy

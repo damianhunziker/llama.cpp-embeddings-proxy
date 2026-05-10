@@ -7,6 +7,7 @@ VRAM-based auto-scaling: automatically starts new instances when model is busy a
 """
 import asyncio
 import json
+import logging
 import os
 import time
 import subprocess
@@ -15,6 +16,13 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from typing import Optional, List, Dict, Any
+
+logger = logging.getLogger("llama-proxy")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
 
 app = FastAPI(title="Llama.cpp General Purpose Proxy")
 
@@ -67,13 +75,18 @@ MODELS_CONFIG = {
         "base_port": 8018,
         "max_instances": 8,
         "model_type": "chat",
+        "stream": False,
         "vram_mb": 6000  # Estimated VRAM per instance in MB
     }
 }
 
 TOOLBOX_CONTAINER = "llama-vulkan-radv"  # ROCm container with proper user mapping
 TIMEOUT_SECONDS = 15 * 60  # 15 minutes for embedding models
-TIMEOUT_SECONDS_CHAT = 1  # 1 second for chat/completion models (close immediately when idle)
+TIMEOUT_SECONDS_CHAT = 180  # 180 seconds for chat/completion models (prompt cache retention)
+
+# Global flag to disable streaming for all chat/completion requests
+# Set to true to force disable streaming, false to allow client control
+DISABLE_STREAMING_GLOBAL = True
 
 
 def kill_llama_server(port: int):
@@ -88,18 +101,18 @@ def kill_llama_server(port: int):
         )
         # pkill returns 0 if processes were found and killed, 1 if none found
         if result.returncode == 0:
-            print(f"[Proxy] -> Killed llama-server on port {port}")
+            logger.info("Killed llama-server on port %d", port)
         elif result.returncode == 1:
-            print(f"[Proxy] -> No llama-server found on port {port}")
+            logger.info("No llama-server found on port %d", port)
         else:
-            print(f"[Proxy] -> pkill error: {result.stderr}")
+            logger.warning("pkill error on port %d: %s", port, result.stderr)
         
         time.sleep(0.3)  # Allow VRAM to be freed
         return True
     except subprocess.TimeoutExpired:
-        print(f"[Proxy] -> pkill timed out for port {port}")
+        logger.warning("pkill timed out for port %d", port)
     except Exception as e:
-        print(f"[Proxy] -> pkill error: {e}")
+        logger.error("pkill error on port %d: %s", port, e)
     
     return False
 
@@ -133,7 +146,7 @@ async def get_vram_info() -> tuple[int, int]:
             capture_output=True, text=True, timeout=10
         )
         if result.returncode != 0:
-            print(f"[Proxy] -> rocm-smi error: {result.stderr}")
+            logger.warning("rocm-smi error: %s", result.stderr)
             return 0, 0
         
         data = json.loads(result.stdout)
@@ -157,7 +170,7 @@ async def get_vram_info() -> tuple[int, int]:
             
         return used_mb, total_mb
     except Exception as e:
-        print(f"[Proxy] -> Failed to get VRAM info: {e}")
+        logger.warning("Failed to get VRAM info: %s", e)
         return 0, 0
 
 
@@ -231,7 +244,7 @@ async def ensure_container_running():
         capture_output=True, text=True, timeout=10
     )
     if result.returncode != 0 or "true" not in result.stdout.lower():
-        print(f"[Proxy] -> Starting container '{TOOLBOX_CONTAINER}'...")
+        logger.info("Starting container '%s'...", TOOLBOX_CONTAINER)
         subprocess.run(["podman", "start", TOOLBOX_CONTAINER], check=True, timeout=60)
         await asyncio.sleep(3)  # Give container time to initialize
 
@@ -244,6 +257,11 @@ def build_llama_server_cmd(config: Dict[str, Any], port: int, instance: int) -> 
     # Use longer timeout for embedding models
     timeout = TIMEOUT_SECONDS_CHAT if model_type in ("chat", "completion") else TIMEOUT_SECONDS
     
+    # Parallel slots: embedding models benefit from batch parallelism,
+    # chat/completion models use 1 slot so each request gets the full --ctx-size.
+    # llama.cpp divides --ctx-size equally among --parallel slots.
+    parallel_slots = 1 if model_type in ("chat", "completion") else 8
+    
     cmd = [
         "/usr/bin/llama-server",  # Full path inside ROCm container
         "-m", config["path"],
@@ -251,9 +269,8 @@ def build_llama_server_cmd(config: Dict[str, Any], port: int, instance: int) -> 
         "--host", "127.0.0.1",
         "-ngl", "99",
         "--sleep-idle-seconds", str(timeout),
-        "--parallel", "8",
-        "--ctx-size", "128000",
-        "-v"  # Verbose logging
+        "--parallel", str(parallel_slots),
+        "--ctx-size", "128000"
     ]
     
     if model_type == "embedding":
@@ -297,7 +314,7 @@ async def find_idle_or_new_instance(model_name: str) -> tuple[int, str]:
                     active_models[key]["busy"] = True
                     return i, key
                 # Unresponsive instance will be cleaned up, remove from active
-                print(f"[Proxy] -> Removing unresponsive instance {i} from active_models")
+                logger.info("Removing unresponsive instance %d from active_models", i)
                 del active_models[key]
         
         # Second pass: find unused slot
@@ -389,7 +406,7 @@ async def ensure_model_instance_running(model_name: str, instance: int):
     # Auto-detect instance if not specified
     if instance == -1:
         instance, key = await find_idle_or_new_instance(model_name)
-        print(f"[Proxy] -> Auto-selected instance {instance} for '{model_name}'")
+        logger.info("Auto-selected instance %d for '%s'", instance, model_name)
     else:
         # Validate instance number for explicit instance
         if instance < 0 or instance >= max_instances:
@@ -419,14 +436,14 @@ async def ensure_model_instance_running(model_name: str, instance: int):
                     active_models[key]["last_used"] = time.time()
                     return port, key
                 else:
-                    print(f"[Proxy] -> Orphaned server on port {port} not responding, restarting...")
+                    logger.warning("Orphaned server on port %d not responding, restarting...", port)
                     del active_models[key]
             elif proc.poll() is None:
                 if await wait_for_server(port, timeout=5):
                     active_models[key]["last_used"] = time.time()
                     return port, key
                 else:
-                    print(f"[Proxy] -> Server on port {port} not responding, restarting...")
+                    logger.warning("Server on port %d not responding, restarting...", port)
                     proc.terminate()
                     try:
                         proc.wait(timeout=5)
@@ -444,7 +461,7 @@ async def ensure_model_instance_running(model_name: str, instance: int):
                 res = await client.get(f"http://127.0.0.1:{port}/health", timeout=2.0)
                 if res.status_code == 200:
                     # Orphaned server found - track it and reuse
-                    print(f"[Proxy] -> Found existing server on port {port}, using it.")
+                    logger.info("Found existing server on port %d, using it.", port)
                     active_models[key] = {
                         "process": None,  # Managed externally
                         "last_used": time.time(),
@@ -463,11 +480,11 @@ async def ensure_model_instance_running(model_name: str, instance: int):
         try:
             kill_llama_server(port)
         except subprocess.TimeoutExpired:
-            print(f"[Proxy] -> pkill timed out for port {port}, continuing anyway")
+            logger.warning("pkill timed out for port %d, continuing anyway", port)
         except Exception as e:
-            print(f"[Proxy] -> pkill error: {e}")
+            logger.error("pkill error: %s", e)
     
-    print(f"[Proxy] -> Starting llama-server for '{model_name}' instance {instance} (type: {model_type}) on internal port {port}...")
+    logger.info("Starting llama-server for '%s' instance %d (type: %s) on internal port %d...", model_name, instance, model_type, port)
     
     # Build command
     # Log file path inside container for this instance
@@ -489,8 +506,8 @@ async def ensure_model_instance_running(model_name: str, instance: int):
         stderr=subprocess.PIPE,
         env=env
     )
-    print(f"[Proxy] -> Started llama-server for '{model_name}' instance {instance} on port {port} (inside container)")
-    print(f"[Proxy] -> View logs: podman exec llama-vulkan-radv cat /tmp/llama-{port}.log")
+    logger.info("Started llama-server for '%s' instance %d on port %d (inside container)", model_name, instance, port)
+    logger.info("View logs: podman exec llama-vulkan-radv cat /tmp/llama-%d.log", port)
     
     # Wait for server to be ready (up to 3 min for large models)
     if not await wait_for_server(port, timeout=180):
@@ -507,7 +524,7 @@ async def ensure_model_instance_running(model_name: str, instance: int):
         "instance": instance,
         "busy": False
     }
-    print(f"[Proxy] -> '{model_name}' instance {instance} ready on internal port {port}")
+    logger.info("'%s' instance %d ready on internal port %d", model_name, instance, port)
     
     # Signal any waiting requests that this instance is ready
     if key in pending_instances:
@@ -539,13 +556,16 @@ async def stop_instance(key: str):
     model_name = data["model_name"]
     instance = data["instance"]
     
-    print(f"[Proxy] -> Stopping '{model_name}' instance {instance} on port {port}.")
+    logger.info("Stopping '%s' instance %d on port %d.", model_name, instance, port)
     kill_llama_server(port)
     del active_models[key]
 
 
 async def cleanup_inactive_models():
-    """Stop model instances that haven't been used for TIMEOUT_SECONDS or are idle."""
+    """Stop model instances that haven't been used for their timeout period or are idle.
+    Chat/completion models: TIMEOUT_SECONDS_CHAT (180s) for prompt cache retention.
+    Embedding models: TIMEOUT_SECONDS (15 min) for long batch processing.
+    """
     while True:
         await asyncio.sleep(60)
         current_time = time.time()
@@ -556,11 +576,15 @@ async def cleanup_inactive_models():
             if data.get("busy", False):
                 continue
             
-            if current_time - data["last_used"] > TIMEOUT_SECONDS:
+            # Use model-type-specific timeout
+            model_type = data.get("model_type", "embedding")
+            timeout = TIMEOUT_SECONDS_CHAT if model_type in ("chat", "completion") else TIMEOUT_SECONDS
+            
+            if current_time - data["last_used"] > timeout:
                 model_name = data["model_name"]
                 instance = data["instance"]
                 port = data["port"]
-                print(f"[Proxy] -> Stopping '{model_name}' instance {instance} (timeout). VRAM released.")
+                logger.info("Stopping '%s' instance %d (timeout after %ds). VRAM released.", model_name, instance, timeout)
                 kill_llama_server(port)
                 del active_models[key]
 
@@ -573,13 +597,13 @@ async def startup_event():
     for name, cfg in MODELS_CONFIG.items():
         max_inst = cfg.get("max_instances", 1)
         model_summary.append(f"{name} (instances 0-{max_inst-1})")
-    print(f"[Proxy] -> Started. Configured models: {model_summary}")
+    logger.info("Started. Configured models: %s", model_summary)
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up all llama-server processes on shutdown."""
-    print("[Proxy] -> Shutting down all internal llama-servers...")
+    logger.info("Shutting down all internal llama-servers...")
     for key, data in active_models.items():
         port = data["port"]
         kill_llama_server(port)
@@ -677,7 +701,7 @@ async def proxy_embeddings(request: Request):
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
     """Start model if needed, forward chat completions request to internal server.
-    For chat models: instance is stopped immediately after request completes.
+    For chat models: instance stays alive for TIMEOUT_SECONDS_CHAT (180s) to enable prompt caching.
     """
     body = await request.json()
     model_name = body.get("model")
@@ -695,6 +719,10 @@ async def proxy_chat_completions(request: Request):
     # Instance parameter: -1 for auto-select, 0+ for specific instance
     instance = body.pop("instance", -1)
     
+    # Global streaming disable flag
+    if DISABLE_STREAMING_GLOBAL and body.get("stream"):
+        body["stream"] = False
+    
     # Ensure model instance is running (starts if not)
     internal_port, key = await ensure_model_instance_running(model_name, instance)
     
@@ -711,14 +739,14 @@ async def proxy_chat_completions(request: Request):
             except httpx.RequestError as e:
                 raise HTTPException(status_code=502, detail=f"Internal server error: {str(e)}")
     finally:
-        # Stop instance immediately after chat/completion request
-        await stop_instance(key)
+        # Mark instance as idle when done - let cleanup task handle removal after timeout
+        mark_instance_idle(key)
 
 
 @app.post("/v1/completions")
 async def proxy_completions(request: Request):
     """Start model if needed, forward text completions request to internal server.
-    For completion models: instance is stopped immediately after request completes.
+    For completion models: instance stays alive for TIMEOUT_SECONDS_CHAT (180s) to enable prompt caching.
     """
     body = await request.json()
     model_name = body.get("model")
@@ -736,6 +764,10 @@ async def proxy_completions(request: Request):
     # Instance parameter: -1 for auto-select, 0+ for specific instance
     instance = body.pop("instance", -1)
     
+    # Global streaming disable flag
+    if DISABLE_STREAMING_GLOBAL and body.get("stream"):
+        body["stream"] = False
+    
     # Ensure model instance is running (starts if not)
     internal_port, key = await ensure_model_instance_running(model_name, instance)
     
@@ -752,8 +784,8 @@ async def proxy_completions(request: Request):
             except httpx.RequestError as e:
                 raise HTTPException(status_code=502, detail=f"Internal server error: {str(e)}")
     finally:
-        # Stop instance immediately after completion request
-        await stop_instance(key)
+        # Mark instance as idle when done - let cleanup task handle removal after timeout
+        mark_instance_idle(key)
 
 
 if __name__ == "__main__":
